@@ -7,8 +7,17 @@ from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 import time
 import threading
+import logging
 import gspread
 from google.oauth2.service_account import Credentials
+
+# ─── LOGGING ──────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+log = logging.getLogger(__name__)
+# ──────────────────────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
 
@@ -37,9 +46,7 @@ SHEET_TAB = "Tracker"
 # ──────────────────────────────────────────────────────────────────────────────
 
 _lock = threading.Lock()
-
-# In-memory job state
-_job = {
+_job  = {
     "status":      "idle",
     "started_at":  None,
     "finished_at": None,
@@ -50,69 +57,63 @@ _job = {
 
 # ─── GOOGLE SHEETS ────────────────────────────────────────────────────────────
 def get_sheet():
-    """Connect to Google Sheets using service account from env variable."""
+    log.info("Connecting to Google Sheets...")
     creds_dict = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
     scopes     = ["https://www.googleapis.com/auth/spreadsheets"]
     creds      = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     client     = gspread.authorize(creds)
     sheet      = client.open_by_key(GOOGLE_SHEET_ID)
-    return sheet.worksheet(SHEET_TAB)
+    ws         = sheet.worksheet(SHEET_TAB)
+    log.info("Connected to Google Sheets successfully")
+    return ws
 
 
 def load_tracker():
-    """Read tracker from Google Sheets. Returns dict: { tracker_key: count }"""
     try:
         ws      = get_sheet()
         records = ws.get_all_records()
         tracker = {}
         for row in records:
-            key   = row.get("tracker_key", "").strip()
+            key   = str(row.get("tracker_key", "")).strip()
             given = int(row.get("free_orders_given", 0) or 0)
             if key:
                 tracker[key] = given
-        print(f"Loaded tracker with {len(tracker)} entries from Google Sheets")
+        log.info(f"Loaded tracker with {len(tracker)} entries from Google Sheets")
         return tracker
     except Exception as e:
-        print(f"Warning: Could not load tracker from Google Sheets: {e}")
+        log.error(f"Could not load tracker from Google Sheets: {e}")
         return {}
 
 
 def save_tracker_row(tracker_key, free_orders_given):
-    """
-    Upsert a single tracker row in Google Sheets.
-    If tracker_key exists → update free_orders_given.
-    If not → append a new row.
-    """
     try:
         ws      = get_sheet()
         records = ws.get_all_records()
         headers = ws.row_values(1)
 
-        # Find existing row
-        for i, row in enumerate(records, start=2):  # start=2 because row 1 is header
-            if row.get("tracker_key", "").strip() == tracker_key:
-                # Update existing row
+        for i, row in enumerate(records, start=2):
+            if str(row.get("tracker_key", "")).strip() == tracker_key:
                 col_given   = headers.index("free_orders_given") + 1
                 col_updated = headers.index("last_updated") + 1
                 ws.update_cell(i, col_given,   free_orders_given)
                 ws.update_cell(i, col_updated, datetime.now(timezone.utc).isoformat())
-                print(f"Updated tracker row for {tracker_key} → {free_orders_given}")
+                log.info(f"Updated tracker row: {tracker_key} → {free_orders_given}")
                 return
 
-        # Not found — append new row
         ws.append_row([
             tracker_key,
             free_orders_given,
             datetime.now(timezone.utc).isoformat()
         ])
-        print(f"Appended new tracker row for {tracker_key} → {free_orders_given}")
+        log.info(f"Appended new tracker row: {tracker_key} → {free_orders_given}")
 
     except Exception as e:
-        print(f"Warning: Could not save tracker row for {tracker_key}: {e}")
+        log.error(f"Could not save tracker row for {tracker_key}: {e}")
 
 
 # ─── PROMOTIONS ───────────────────────────────────────────────────────────────
 def fetch_bundle_gift_promotions():
+    log.info("Fetching bundle_gift promotions...")
     all_promos = []
     page = 1
     while True:
@@ -125,7 +126,9 @@ def fetch_bundle_gift_promotions():
             p for p in items
             if p.get("discount_type") == "bundle_gift" and p.get("status") == "active"
         ])
-        if page >= data.get("pagination", {}).get("total_pages", 1):
+        total_pages = data.get("pagination", {}).get("total_pages", 1)
+        log.info(f"Promotions page {page}/{total_pages}")
+        if page >= total_pages:
             break
         page += 1
 
@@ -149,11 +152,13 @@ def fetch_bundle_gift_promotions():
     for key in tier_groups:
         tier_groups[key].sort(key=lambda t: t["min_item_count"])
 
+    log.info(f"Found {len(all_promos)} bundle_gift promo records → {len(tier_groups)} promo group(s)")
     return tier_groups
 
 
 # ─── ORDERS ───────────────────────────────────────────────────────────────────
 def fetch_all_orders(days=5):
+    log.info(f"Fetching paid orders from last {days} days...")
     now    = datetime.now(timezone.utc)
     chunks = []
     for i in range(days - 1, -1, -1):
@@ -165,7 +170,7 @@ def fetch_all_orders(days=5):
     all_orders = []
     seen       = set()
 
-    for chunk in chunks:
+    for idx, chunk in enumerate(chunks, 1):
         page = 1
         while True:
             resp = req.get(f"{BASE_URL}/orders", headers=HEADERS, params={
@@ -179,11 +184,14 @@ def fetch_all_orders(days=5):
             items       = data.get("items", [])
             pagination  = data.get("pagination", {})
             total_pages = min(pagination.get("total_pages", 1), MAX_PAGE)
+            total_count = pagination.get("total_count", 0)
 
             paid = [o for o in items if o.get("order_payment", {}).get("status") == "completed"]
             new  = [o for o in paid if o["order_number"] not in seen]
             seen.update(o["order_number"] for o in new)
             all_orders.extend(new)
+
+            log.info(f"Chunk {idx}/5 | Page {page}/{total_pages} ({total_count} total) | +{len(new)} new orders | running total: {len(all_orders)}")
 
             if page >= total_pages:
                 break
@@ -191,11 +199,14 @@ def fetch_all_orders(days=5):
             time.sleep(0.2)
         time.sleep(0.3)
 
+    log.info(f"Total unique paid orders fetched: {len(all_orders)}")
     return all_orders
 
 
 # ─── QUALIFICATION ────────────────────────────────────────────────────────────
 def check_qualification(all_orders, tier_groups, tracker):
+    log.info(f"Checking qualification for {len(all_orders)} orders across {len(tier_groups)} promo groups...")
+
     customer_map = defaultdict(lambda: {
         "customer_name":  "",
         "customer_phone": "",
@@ -224,6 +235,8 @@ def check_qualification(all_orders, tier_groups, tracker):
             if pid and qty:
                 c["product_qty"][pid] += qty
 
+    log.info(f"Unique customers: {len(customer_map)}")
+
     to_fulfill = []
     for product_ids_key, tiers in tier_groups.items():
         product_ids = list(product_ids_key)
@@ -240,6 +253,7 @@ def check_qualification(all_orders, tier_groups, tracker):
                 given   = tracker.get(tkey, 0)
                 to_give = owed - given
                 if to_give > 0:
+                    log.info(f"QUALIFY: {c['customer_name']} | {tier['title'][:40]} | qty={total_qty} owed={owed} given={given} → create {to_give}")
                     to_fulfill.append({
                         "customer_id":           cid,
                         "customer_name":         c["customer_name"],
@@ -252,6 +266,7 @@ def check_qualification(all_orders, tier_groups, tracker):
                         "last_order":            c["last_order"]
                     })
 
+    log.info(f"Total free orders to create: {sum(f['free_orders_to_create'] for f in to_fulfill)}")
     return to_fulfill
 
 
@@ -291,6 +306,7 @@ def create_free_order(customer, tier, last_order):
            if last_delivery_data.get("location_code") else {})
     }
 
+    log.info(f"Creating free order for {customer['customer_name']} | promo: {tier['title'][:40]}")
     resp = req.post(
         f"{BASE_URL}/orders",
         headers={**HEADERS, "content-type": "application/json"},
@@ -298,34 +314,31 @@ def create_free_order(customer, tier, last_order):
     )
 
     if resp.status_code in (200, 201):
-        order = resp.json()
-        return order.get("order_number") or order.get("id")
+        order        = resp.json()
+        order_number = order.get("order_number") or order.get("id")
+        log.info(f"Free order created: {order_number} for {customer['customer_name']}")
+        return order_number
     else:
-        print(f"Failed to create order for {customer['customer_name']}: {resp.status_code} {resp.text[:200]}")
+        log.error(f"Failed to create order for {customer['customer_name']}: {resp.status_code} {resp.text[:300]}")
         return None
 
 
 # ─── MAIN JOB ─────────────────────────────────────────────────────────────────
 def run_job():
     global _job
-
     try:
         _job["status"]     = "running"
         _job["started_at"] = datetime.now(timezone.utc).isoformat()
         _job["result"]     = None
         _job["error"]      = None
 
-        # 1. Load tracker from Google Sheets
-        tracker = load_tracker()
+        log.info("=== JOB STARTED ===")
 
-        # 2. Fetch promotions and orders
+        tracker     = load_tracker()
         tier_groups = fetch_bundle_gift_promotions()
         all_orders  = fetch_all_orders(days=DAYS_BACK)
+        to_fulfill  = check_qualification(all_orders, tier_groups, tracker)
 
-        # 3. Check qualification
-        to_fulfill = check_qualification(all_orders, tier_groups, tracker)
-
-        # 4. Create free orders + update tracker in Google Sheets immediately
         created = []
         for entry in to_fulfill:
             for _ in range(entry["free_orders_to_create"]):
@@ -333,10 +346,7 @@ def run_job():
                 if order_number:
                     tkey = entry["tracker_key"]
                     tracker[tkey] = tracker.get(tkey, 0) + 1
-
-                    # Write to Google Sheets immediately after each success
                     save_tracker_row(tkey, tracker[tkey])
-
                     created.append({
                         "tracker_key":      tkey,
                         "customer_name":    entry["customer_name"],
@@ -359,13 +369,13 @@ def run_job():
         _job["status"]      = "done"
         _job["finished_at"] = datetime.now(timezone.utc).isoformat()
         _job["result"]      = result
-        print(f"Job done — {len(created)} free orders created")
+        log.info(f"=== JOB DONE — {len(created)} free orders created ===")
 
     except Exception as e:
+        log.exception(f"=== JOB ERROR: {e} ===")
         _job["status"]      = "error"
         _job["finished_at"] = datetime.now(timezone.utc).isoformat()
         _job["error"]       = str(e)
-        print(f"Job error: {e}")
     finally:
         _lock.release()
 
@@ -378,10 +388,6 @@ def health():
 
 @app.route("/run", methods=["POST"])
 def run():
-    """
-    Starts the job in the background and returns immediately.
-    Poll /status to check progress.
-    """
     if not _lock.acquire(blocking=False):
         return jsonify({"status": "already_running", "message": "Job is already running. Poll /status for progress."}), 200
 
@@ -389,15 +395,12 @@ def run():
     thread.daemon = True
     thread.start()
 
-    return jsonify({
-        "status":  "started",
-        "message": "Job started in background. Poll /status to check progress."
-    }), 200
+    log.info("Job triggered via POST /run")
+    return jsonify({"status": "started", "message": "Job started. Poll /status to check progress."}), 200
 
 
 @app.route("/status", methods=["GET"])
 def status():
-    """Check job status. Returns result when done."""
     return jsonify({
         "status":      _job["status"],
         "started_at":  _job["started_at"],
@@ -409,4 +412,5 @@ def status():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
+    log.info(f"Starting app on port {port}")
     app.run(host="0.0.0.0", port=port)
