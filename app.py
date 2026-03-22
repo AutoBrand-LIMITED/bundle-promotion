@@ -7,6 +7,8 @@ from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 import time
 import threading
+import gspread
+from google.oauth2.service_account import Credentials
 
 app = Flask(__name__)
 
@@ -14,6 +16,15 @@ app = Flask(__name__)
 API_TOKEN = os.environ.get("SHOPLINE_API_TOKEN")
 if not API_TOKEN:
     raise RuntimeError("Missing required environment variable: SHOPLINE_API_TOKEN")
+
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+if not GOOGLE_SERVICE_ACCOUNT_JSON:
+    raise RuntimeError("Missing required environment variable: GOOGLE_SERVICE_ACCOUNT_JSON")
+
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
+if not GOOGLE_SHEET_ID:
+    raise RuntimeError("Missing required environment variable: GOOGLE_SHEET_ID")
+
 BASE_URL  = "https://open.shopline.io/v1"
 HEADERS   = {
     "accept":        "application/json",
@@ -22,9 +33,82 @@ HEADERS   = {
 PER_PAGE  = 100
 MAX_PAGE  = 100
 DAYS_BACK = 5
+SHEET_TAB = "Tracker"
 # ──────────────────────────────────────────────────────────────────────────────
 
 _lock = threading.Lock()
+
+# In-memory job state
+_job = {
+    "status":      "idle",
+    "started_at":  None,
+    "finished_at": None,
+    "result":      None,
+    "error":       None
+}
+
+
+# ─── GOOGLE SHEETS ────────────────────────────────────────────────────────────
+def get_sheet():
+    """Connect to Google Sheets using service account from env variable."""
+    creds_dict = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+    scopes     = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds      = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    client     = gspread.authorize(creds)
+    sheet      = client.open_by_key(GOOGLE_SHEET_ID)
+    return sheet.worksheet(SHEET_TAB)
+
+
+def load_tracker():
+    """Read tracker from Google Sheets. Returns dict: { tracker_key: count }"""
+    try:
+        ws      = get_sheet()
+        records = ws.get_all_records()
+        tracker = {}
+        for row in records:
+            key   = row.get("tracker_key", "").strip()
+            given = int(row.get("free_orders_given", 0) or 0)
+            if key:
+                tracker[key] = given
+        print(f"Loaded tracker with {len(tracker)} entries from Google Sheets")
+        return tracker
+    except Exception as e:
+        print(f"Warning: Could not load tracker from Google Sheets: {e}")
+        return {}
+
+
+def save_tracker_row(tracker_key, free_orders_given):
+    """
+    Upsert a single tracker row in Google Sheets.
+    If tracker_key exists → update free_orders_given.
+    If not → append a new row.
+    """
+    try:
+        ws      = get_sheet()
+        records = ws.get_all_records()
+        headers = ws.row_values(1)
+
+        # Find existing row
+        for i, row in enumerate(records, start=2):  # start=2 because row 1 is header
+            if row.get("tracker_key", "").strip() == tracker_key:
+                # Update existing row
+                col_given   = headers.index("free_orders_given") + 1
+                col_updated = headers.index("last_updated") + 1
+                ws.update_cell(i, col_given,   free_orders_given)
+                ws.update_cell(i, col_updated, datetime.now(timezone.utc).isoformat())
+                print(f"Updated tracker row for {tracker_key} → {free_orders_given}")
+                return
+
+        # Not found — append new row
+        ws.append_row([
+            tracker_key,
+            free_orders_given,
+            datetime.now(timezone.utc).isoformat()
+        ])
+        print(f"Appended new tracker row for {tracker_key} → {free_orders_given}")
+
+    except Exception as e:
+        print(f"Warning: Could not save tracker row for {tracker_key}: {e}")
 
 
 # ─── PROMOTIONS ───────────────────────────────────────────────────────────────
@@ -112,10 +196,6 @@ def fetch_all_orders(days=5):
 
 # ─── QUALIFICATION ────────────────────────────────────────────────────────────
 def check_qualification(all_orders, tier_groups, tracker):
-    """
-    tracker is a dict passed in from n8n (read from Google Sheets):
-    { "customer_id|promo_id": free_orders_already_given }
-    """
     customer_map = defaultdict(lambda: {
         "customer_name":  "",
         "customer_phone": "",
@@ -226,40 +306,68 @@ def create_free_order(customer, tier, last_order):
 
 
 # ─── MAIN JOB ─────────────────────────────────────────────────────────────────
-def run_job(tracker):
-    tier_groups = fetch_bundle_gift_promotions()
-    all_orders  = fetch_all_orders(days=DAYS_BACK)
-    to_fulfill  = check_qualification(all_orders, tier_groups, tracker)
+def run_job():
+    global _job
 
-    created          = []
-    updated_tracker  = dict(tracker)  # copy so we can return changes to n8n
+    try:
+        _job["status"]     = "running"
+        _job["started_at"] = datetime.now(timezone.utc).isoformat()
+        _job["result"]     = None
+        _job["error"]      = None
 
-    for entry in to_fulfill:
-        for _ in range(entry["free_orders_to_create"]):
-            order_number = create_free_order(entry, entry["tier"], entry["last_order"])
-            if order_number:
-                tkey = entry["tracker_key"]
-                updated_tracker[tkey] = updated_tracker.get(tkey, 0) + 1
-                created.append({
-                    "tracker_key":      tkey,
-                    "customer_id":      entry["customer_id"],
-                    "customer_name":    entry["customer_name"],
-                    "customer_phone":   entry["customer_phone"],
-                    "customer_email":   entry["customer_email"],
-                    "promo_title":      entry["tier"]["title"],
-                    "order_number":     order_number,
-                    "gift_product_ids": entry["tier"]["gift_product_ids"],
-                    "gift_qty":         entry["tier"]["gift_qty"]
-                })
-            time.sleep(0.5)
+        # 1. Load tracker from Google Sheets
+        tracker = load_tracker()
 
-    return {
-        "run_at":               datetime.now(timezone.utc).isoformat(),
-        "total_orders_checked": len(all_orders),
-        "free_orders_created":  len(created),
-        "details":              created,
-        "updated_tracker":      updated_tracker  # n8n writes this back to Google Sheets
-    }
+        # 2. Fetch promotions and orders
+        tier_groups = fetch_bundle_gift_promotions()
+        all_orders  = fetch_all_orders(days=DAYS_BACK)
+
+        # 3. Check qualification
+        to_fulfill = check_qualification(all_orders, tier_groups, tracker)
+
+        # 4. Create free orders + update tracker in Google Sheets immediately
+        created = []
+        for entry in to_fulfill:
+            for _ in range(entry["free_orders_to_create"]):
+                order_number = create_free_order(entry, entry["tier"], entry["last_order"])
+                if order_number:
+                    tkey = entry["tracker_key"]
+                    tracker[tkey] = tracker.get(tkey, 0) + 1
+
+                    # Write to Google Sheets immediately after each success
+                    save_tracker_row(tkey, tracker[tkey])
+
+                    created.append({
+                        "tracker_key":      tkey,
+                        "customer_name":    entry["customer_name"],
+                        "customer_phone":   entry["customer_phone"],
+                        "customer_email":   entry["customer_email"],
+                        "promo_title":      entry["tier"]["title"],
+                        "order_number":     order_number,
+                        "gift_product_ids": entry["tier"]["gift_product_ids"],
+                        "gift_qty":         entry["tier"]["gift_qty"]
+                    })
+                time.sleep(0.5)
+
+        result = {
+            "run_at":               datetime.now(timezone.utc).isoformat(),
+            "total_orders_checked": len(all_orders),
+            "free_orders_created":  len(created),
+            "details":              created
+        }
+
+        _job["status"]      = "done"
+        _job["finished_at"] = datetime.now(timezone.utc).isoformat()
+        _job["result"]      = result
+        print(f"Job done — {len(created)} free orders created")
+
+    except Exception as e:
+        _job["status"]      = "error"
+        _job["finished_at"] = datetime.now(timezone.utc).isoformat()
+        _job["error"]       = str(e)
+        print(f"Job error: {e}")
+    finally:
+        _lock.release()
 
 
 # ─── FLASK ROUTES ─────────────────────────────────────────────────────────────
@@ -271,30 +379,32 @@ def health():
 @app.route("/run", methods=["POST"])
 def run():
     """
-    n8n calls POST /run with the current tracker from Google Sheets in the body.
-    Returns results + updated_tracker for n8n to write back to Google Sheets.
-
-    Expected body:
-    {
-      "tracker": {
-        "customer_id|promo_id": 1,
-        "customer_id|promo_id": 2,
-        ...
-      }
-    }
+    Starts the job in the background and returns immediately.
+    Poll /status to check progress.
     """
     if not _lock.acquire(blocking=False):
-        return jsonify({"error": "Job already running. Try again shortly."}), 429
+        return jsonify({"status": "already_running", "message": "Job is already running. Poll /status for progress."}), 200
 
-    try:
-        body    = request.get_json(silent=True) or {}
-        tracker = body.get("tracker", {})  # tracker passed in from n8n Google Sheets
-        report  = run_job(tracker)
-        return jsonify(report), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    finally:
-        _lock.release()
+    thread = threading.Thread(target=run_job)
+    thread.daemon = True
+    thread.start()
+
+    return jsonify({
+        "status":  "started",
+        "message": "Job started in background. Poll /status to check progress."
+    }), 200
+
+
+@app.route("/status", methods=["GET"])
+def status():
+    """Check job status. Returns result when done."""
+    return jsonify({
+        "status":      _job["status"],
+        "started_at":  _job["started_at"],
+        "finished_at": _job["finished_at"],
+        "result":      _job["result"],
+        "error":       _job["error"]
+    }), 200
 
 
 if __name__ == "__main__":
