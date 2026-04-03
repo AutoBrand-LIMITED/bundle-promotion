@@ -3,3 +3,5 @@ requests
 gunicorn
 gspread
 google-auth
+python-dotenv
+modal
